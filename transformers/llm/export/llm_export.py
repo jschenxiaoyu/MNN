@@ -111,6 +111,8 @@ class LLM(torch.nn.Module):
         self.hidden_size = 4096
         self.visual = None # defualt is not visual
         self.lora_path = args.lora_path
+        self.seq_len = args.seq_len
+        self.cache_len = args.cache_len
         self.load_hf(args.path)
         self.load_model()
 
@@ -275,7 +277,7 @@ class LLM(torch.nn.Module):
             with open(f'./{self.mnn_path}/embeddings_bf16.bin', 'wb') as f:
                 f.write(buffer)
             return
-        input_ids = torch.arange(3, dtype=torch.long)
+        input_ids = torch.arange(self.seq_len, dtype=torch.long)
         onnx_model = f'./{self.onnx_path}/embedding.onnx'
         torch.onnx.export(model, (input_ids),
                         onnx_model,
@@ -302,7 +304,6 @@ class LLM(torch.nn.Module):
             onnx2mnn(onnx_model, self.mnn_path)
 
     def export_block(self, block_id: int):
-        self.seq_len = 3
         self.token_len = 0
         inputs_embeds = torch.randn((self.seq_len, 1, self.hidden_size))
         attention_mask =  self.get_attention_mask()
@@ -318,7 +319,7 @@ class LLM(torch.nn.Module):
                 'inputs_embeds', 'attention_mask', 'position_ids', 'past_key_values'
             ],
             output_names=['hidden_states', 'presents'],
-            dynamic_axes=self.block_dynamic_axes,
+            dynamic_axes=None,
             do_constant_folding=True,
             opset_version=15)
         if not self.skip_slim:
@@ -343,7 +344,6 @@ class LLM(torch.nn.Module):
 
     def export(self):
         model = self
-        self.seq_len = 3
         self.token_len = 0
         input_ids = torch.arange(3, dtype=torch.long)
         attention_mask =  self.get_attention_mask()
@@ -815,7 +815,7 @@ class Qwen2_Chat(LLM):
         self.final_layernorm_ = transformer.norm
         # some wrapper
         self.stop_id = self.tokenizer.eos_token_id
-        if hasattr(model, 'generation_config'):
+        if hasattr(self.model, 'generation_config'):
             self.stop_ids.append(self.stop_id)
             for id in self.model.generation_config.eos_token_id:
                 self.stop_ids.append(id)
@@ -825,7 +825,7 @@ class Qwen2_Chat(LLM):
         self.head_dim = self.hidden_size // self.num_heads
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
-        self.past_kv_shape = [self.block_nums, 2, 1, self.num_heads, 0, self.head_dim]
+        self.past_kv_shape = [self.block_nums, 2, 1, self.num_heads, self.cache_len, self.head_dim]
         self.blocks = [QWEN2Block(self.model_name, self.blocks_[i], i, self.hidden_size, self.head_dim, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
         self.block_dynamic_axes = {
@@ -846,8 +846,8 @@ class Qwen2_Chat(LLM):
 
     def get_attention_mask(self) -> torch.Tensor:
         if self.token_len:
-            return torch.zeros([1, 1, 1, self.seq_len], dtype=torch.float32)
-        return (1 - torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]))) * torch.finfo(torch.float32).min
+            return torch.zeros([1, 1, 1, self.cache_len], dtype=torch.float32)
+        return (1 - torch.tril(torch.ones([1, 1, self.seq_len, self.cache_len]))) * torch.finfo(torch.float32).min
 
 
     def get_position_ids(self) -> torch.Tensor:
@@ -1192,6 +1192,7 @@ if __name__ == '__main__':
         'Qwen1_5-1_8B-Chat': Qwen2_Chat,
         'Qwen1_5-4B-Chat': Qwen2_Chat,
         'Qwen1_5-7B-Chat': Qwen2_Chat,
+        'Qwen2_5-1_5B-Instruct': Qwen2_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Llama-2-7b-chat-ms': Llama2_7b_Chat,
         'Llama-3-8B-Instruct': Llama2_7b_Chat,
@@ -1235,7 +1236,8 @@ if __name__ == '__main__':
     parser.add_argument('--embed_bin', action='store_true', help='export embedding weight as bin file with dtype `bfloat16`')
     parser.add_argument('--embed_bf16', action='store_true', help='using `bfloat16` replace `float32` in embedding.')
     parser.add_argument('--skip_slim', action='store_true', help='Whether or not to skip onnx-slim.')
-
+    parser.add_argument('--seq_len', type=int, default=256, help='sequence length for test.')
+    parser.add_argument('--cache_len', type=int, default=1024, help='cache length for test.')
 
     args = parser.parse_args()
     model_path = args.path
